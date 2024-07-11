@@ -36,7 +36,7 @@ class DTLRepo:
         return os.path.join(self.get_absolute_path(), 'module-types')
 
     def slug_format(self, name):
-        return re_sub('\W+', '-', name.lower())
+        return re_sub(r'\W+', '-', name.lower()) # Fix #139
 
     def pull_repo(self):
         try:
@@ -85,12 +85,17 @@ class DTLRepo:
     def parse_files(self, files: list, slugs: list = None):
         deviceTypes = []
         for file in files:
+            self.handle.verbose_log(f"Parsing file {file}")
             with open(file, 'r') as stream:
                 try:
                     data = yaml.safe_load(stream)
                 except yaml.YAMLError as excep:
                     self.handle.verbose_log(excep)
                     continue
+                except UnicodeDecodeError as excep:
+                    self.handle.verbose_log(excep)
+                    continue
+
                 manufacturer = data['manufacturer']
                 data['manufacturer'] = {
                     'name': manufacturer, 'slug': self.slug_format(manufacturer)}
