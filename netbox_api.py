@@ -1,4 +1,8 @@
 from collections import Counter
+import copy
+import time
+import http
+import http.client
 import pynetbox
 import requests
 import os
@@ -17,12 +21,14 @@ class NetBox:
             module_added=0,
             module_port_added=0,
             images=0,
+            connection_errors=0,
         )
         self.url = settings.NETBOX_URL
         self.token = settings.NETBOX_TOKEN
         self.handle = settings.handle
         self.netbox = None
         self.ignore_ssl = settings.IGNORE_SSL_ERRORS
+        self.retry_delay = int(settings.RETRY_DELAY)
         self.modules = False
         self.connect_api()
         self.verify_compatibility()
@@ -62,7 +68,7 @@ class NetBox:
         self.existing_manufacturers = self.get_manufacturers()
         for vendor in vendors:
             try:
-                manGet = self.existing_manufacturers[vendor["name"]]
+                manGet = self.existing_manufacturers[vendor['name']]
                 self.handle.verbose_log(f'Manufacturer Exists: {manGet.name} - {manGet.id}')
             except KeyError:
                 to_create.append(vendor)
@@ -80,65 +86,91 @@ class NetBox:
                 self.handle.verbose_log(f"Error during manufacturer creation. - {request_error.error}")
 
     def create_device_types(self, device_types_to_add):
-        for device_type in device_types_to_add:
+        retry_amount = 2
 
-            # Remove file base path
-            src_file = device_type["src"]
-            del device_type["src"]
+        # Treat the original data as immutable in case we encounter a connection error.
+        for device_type_immutable in device_types_to_add:
+            # In the event we hit a ConnectionReset error on this item, we want to retry it.
+            # If it fails twice, assume it's an issue with the device_type
+            retries = 0
 
-            # Pre-process front/rear_image flag, remove it if present
-            saved_images = {}
-            image_base = os.path.dirname(src_file).replace("device-types","elevation-images")
-            for i in ["front_image","rear_image"]:
-                if i in device_type:
-                    if device_type[i]:
-                        image_glob = f"{image_base}/{device_type['slug']}.{i.split('_')[0]}.*"
-                        images = glob.glob(image_glob, recursive=False)
-                        if images:
-                          saved_images[i] = images[0]
-                        else:
-                          self.handle.log(f"Error locating image file using '{image_glob}'")
-                    del device_type[i]
+            while retries < retry_amount:
+                device_type = copy.deepcopy(device_type_immutable) # Can this be a copy.copy(device_type_immutable)?
 
-            try:
-                dt = self.device_types.existing_device_types[device_type["model"]]
-                self.handle.verbose_log(f'Device Type Exists: {dt.manufacturer.name} - '
-                    + f'{dt.model} - {dt.id}')
-            except KeyError:
                 try:
-                    dt = self.netbox.dcim.device_types.create(device_type)
-                    self.counter.update({'added': 1})
-                    self.handle.verbose_log(f'Device Type Created: {dt.manufacturer.name} - '
-                        + f'{dt.model} - {dt.id}')
-                except pynetbox.RequestError as e:
-                    self.handle.log(f'Error {e.error} creating device type:'
-                                    f' {device_type["manufacturer"]["name"]} {device_type["model"]}')
+                    if retries == 0:
+                        self.handle.verbose_log(f'Processing Source File: {device_type['src']}')
+                    else:
+                        self.handle.verbose_log(f'(Retry {retries}/{retry_amount}) Processing Source File: {device_type['src']}')
+
+                    # Remove file base path
+                    src_file = device_type['src']
+                    del device_type['src']
+
+                    # Pre-process front/rear_image flag, remove it if present
+                    saved_images = {}
+                    image_base = os.path.dirname(src_file).replace("device-types","elevation-images")
+                    for i in ['front_image','rear_image']:
+                        if i in device_type:
+                            if device_type[i]:
+                                image_glob = f"{image_base}/{device_type['slug']}.{i.split('_')[0]}.*"
+                                images = glob.glob(image_glob, recursive=False)
+                                if images:
+                                    saved_images[i] = images[0]
+                                else:
+                                    self.handle.log(f"Error locating image file using '{image_glob}'")
+                            del device_type[i]
+
+                    try:
+                        dt = self.device_types.existing_device_types[device_type['model']]
+                        self.handle.verbose_log(f'Device Type Exists: {dt.manufacturer.name} - {dt.model} - {dt.id}')
+                    except KeyError:
+                        try:
+                            dt = self.netbox.dcim.device_types.create(device_type)
+                            self.counter.update({'added': 1})
+                            self.handle.verbose_log(f'Device Type Created: {dt.manufacturer.name} - {dt.model} - {dt.id}')
+                        except pynetbox.RequestError as e:
+                            self.handle.log(f'Error {e.error} creating device type: {device_type['manufacturer']['name']} {device_type['model']}')
+                            retries += 1
+                            continue
+
+                    if "interfaces" in device_type:
+                        self.device_types.create_interfaces(device_type['interfaces'], dt.id)
+                    if "power-ports" in device_type:
+                        self.device_types.create_power_ports(device_type['power-ports'], dt.id)
+                    if "power-port" in device_type:
+                        self.device_types.create_power_ports(device_type['power-port'], dt.id)
+                    if "console-ports" in device_type:
+                        self.device_types.create_console_ports(device_type['console-ports'], dt.id)
+                    if "power-outlets" in device_type:
+                        self.device_types.create_power_outlets(device_type['power-outlets'], dt.id)
+                    if "console-server-ports" in device_type:
+                        self.device_types.create_console_server_ports(device_type['console-server-ports'], dt.id)
+                    if "rear-ports" in device_type:
+                        self.device_types.create_rear_ports(device_type['rear-ports'], dt.id)
+                    if "front-ports" in device_type:
+                        self.device_types.create_front_ports(device_type['front-ports'], dt.id)
+                    if "device-bays" in device_type:
+                        self.device_types.create_device_bays(device_type['device-bays'], dt.id)
+                    if self.modules and 'module-bays' in device_type:
+                        self.device_types.create_module_bays(device_type['module-bays'], dt.id)
+
+                    # Finally, update images if any
+                    if saved_images:
+                        self.device_types.upload_images(self.url, self.token, saved_images, dt.id)
+                    
+                    # We successfully processed the device. Don't retry it.
+                    retries = retry_amount
+                except (http.client.RemoteDisconnected, requests.exceptions.ConnectionError) as e:
+                    retries += 1
+                    self.counter.update({'connection_errors': 1})
+                    self.handle.log(f'A connection error occurred (Count: {self.counter['connection_errors']})! Waiting {self.retry_delay} seconds then retrying... Exception: {e}')
+                    
+                    # As a connection error has just occurred, we should give the remote end a moment then reconnect.
+                    time.sleep(self.retry_delay)
+                    self.connect_api()
                     continue
 
-            if "interfaces" in device_type:
-                self.device_types.create_interfaces(device_type["interfaces"], dt.id)
-            if "power-ports" in device_type:
-                self.device_types.create_power_ports(device_type["power-ports"], dt.id)
-            if "power-port" in device_type:
-                self.device_types.create_power_ports(device_type["power-port"], dt.id)
-            if "console-ports" in device_type:
-                self.device_types.create_console_ports(device_type["console-ports"], dt.id)
-            if "power-outlets" in device_type:
-                self.device_types.create_power_outlets(device_type["power-outlets"], dt.id)
-            if "console-server-ports" in device_type:
-                self.device_types.create_console_server_ports(device_type["console-server-ports"], dt.id)
-            if "rear-ports" in device_type:
-                self.device_types.create_rear_ports(device_type["rear-ports"], dt.id)
-            if "front-ports" in device_type:
-                self.device_types.create_front_ports(device_type["front-ports"], dt.id)
-            if "device-bays" in device_type:
-                self.device_types.create_device_bays(device_type["device-bays"], dt.id)
-            if self.modules and 'module-bays' in device_type:
-                self.device_types.create_module_bays(device_type['module-bays'], dt.id)
-
-            # Finally, update images if any
-            if saved_images:
-                self.device_types.upload_images(self.url, self.token, saved_images, dt.id)
 
     def create_module_types(self, module_types):
         all_module_types = {}
@@ -147,37 +179,63 @@ class NetBox:
                 all_module_types[curr_nb_mt.manufacturer.slug] = {}
 
             all_module_types[curr_nb_mt.manufacturer.slug][curr_nb_mt.model] = curr_nb_mt
+        
+        retry_amount = 2
+        # Treat the original data as immutable in case we encounter a connection error.
+        for curr_mt_immutable in module_types:
+            # In the event we hit a ConnectionReset error on this item, we want to retry it.
+            # If it fails twice, assume it's an issue with the device_type
+            retries = 0
 
+            while retries < retry_amount:
+                curr_mt = copy.deepcopy(curr_mt_immutable) # Can this be a copy.copy(curr_mt_immutable)?
 
-        for curr_mt in module_types:
-            try:
-                module_type_res = all_module_types[curr_mt['manufacturer']['slug']][curr_mt["model"]]
-                self.handle.verbose_log(f'Module Type Exists: {module_type_res.manufacturer.name} - '
-                    + f'{module_type_res.model} - {module_type_res.id}')
-            except KeyError:
                 try:
-                    module_type_res = self.netbox.dcim.module_types.create(curr_mt)
-                    self.counter.update({'module_added': 1})
-                    self.handle.verbose_log(f'Module Type Created: {module_type_res.manufacturer.name} - '
-                        + f'{module_type_res.model} - {module_type_res.id}')
-                except pynetbox.RequestError as exce:
-                    self.handle.log(f"Error '{exce.error}' creating module type: " +
-                        f"{curr_mt}")
+                    if retries == 0:
+                        self.handle.verbose_log(f'Processing Source File: {curr_mt['src']}')
+                    else:
+                        self.handle.verbose_log(f'(Retry {retries}/{retry_amount}) Processing Source File: {curr_mt['src']}')
 
-            if "interfaces" in curr_mt:
-                self.device_types.create_module_interfaces(curr_mt["interfaces"], module_type_res.id)
-            if "power-ports" in curr_mt:
-                self.device_types.create_module_power_ports(curr_mt["power-ports"], module_type_res.id)
-            if "console-ports" in curr_mt:
-                self.device_types.create_module_console_ports(curr_mt["console-ports"], module_type_res.id)
-            if "power-outlets" in curr_mt:
-                self.device_types.create_module_power_outlets(curr_mt["power-outlets"], module_type_res.id)
-            if "console-server-ports" in curr_mt:
-                self.device_types.create_module_console_server_ports(curr_mt["console-server-ports"], module_type_res.id)
-            if "rear-ports" in curr_mt:
-                self.device_types.create_module_rear_ports(curr_mt["rear-ports"], module_type_res.id)
-            if "front-ports" in curr_mt:
-                self.device_types.create_module_front_ports(curr_mt["front-ports"], module_type_res.id)
+                    try:
+                        module_type_res = all_module_types[curr_mt['manufacturer']['slug']][curr_mt['model']]
+                        self.handle.verbose_log(f'Module Type Exists: {module_type_res.manufacturer.name} - {module_type_res.model} - {module_type_res.id}')
+                    except KeyError:
+                        try:
+                            module_type_res = self.netbox.dcim.module_types.create(curr_mt)
+                            self.counter.update({'module_added': 1})
+                            self.handle.verbose_log(f'Module Type Created: {module_type_res.manufacturer.name} - {module_type_res.model} - {module_type_res.id}')
+                        except pynetbox.RequestError as exce:
+                            self.handle.log(f"Error '{exce.error}' creating module type: {curr_mt['manufacturer']} {curr_mt['model']} {curr_mt['part_number']}")
+                            retries += 1
+                            continue
+
+                    if "interfaces" in curr_mt:
+                        self.device_types.create_module_interfaces(curr_mt['interfaces'], module_type_res.id)
+                    if "power-ports" in curr_mt:
+                        self.device_types.create_module_power_ports(curr_mt['power-ports'], module_type_res.id)
+                    if "console-ports" in curr_mt:
+                        self.device_types.create_module_console_ports(curr_mt['console-ports'], module_type_res.id)
+                    if "power-outlets" in curr_mt:
+                        self.device_types.create_module_power_outlets(curr_mt['power-outlets'], module_type_res.id)
+                    if "console-server-ports" in curr_mt:
+                        self.device_types.create_module_console_server_ports(curr_mt['console-server-ports'], module_type_res.id)
+                    if "rear-ports" in curr_mt:
+                        self.device_types.create_module_rear_ports(curr_mt['rear-ports'], module_type_res.id)
+                    if "front-ports" in curr_mt:
+                        self.device_types.create_module_front_ports(curr_mt['front-ports'], module_type_res.id)
+
+                    # We successfully processed the device. Don't retry it.
+                    retries = retry_amount
+                
+                except (http.client.RemoteDisconnected, requests.exceptions.ConnectionError) as e:
+                    retries += 1
+                    self.counter.update({'connection_errors': 1})
+                    self.handle.log(f'A connection error occurred (Count: {self.counter['connection_errors']})! Waiting {self.retry_delay} seconds then retrying... Exception: {e}')
+                    
+                    # As a connection error has just occurred, we should give the remote end a moment then reconnect.
+                    time.sleep(self.retry_delay)
+                    self.connect_api()
+                    continue
 
 class DeviceTypes:
     def __new__(cls, *args, **kwargs):
@@ -268,7 +326,7 @@ class DeviceTypes:
             existing_power_ports = self.get_power_ports(device_type)
             for outlet in to_create:
                 try:
-                    power_port = existing_power_ports[outlet["power_port"]]
+                    power_port = existing_power_ports[outlet['power_port']]
                     outlet['power_port'] = power_port.id
                 except KeyError:
                     pass
@@ -315,11 +373,11 @@ class DeviceTypes:
             all_rearports = self.get_rear_ports(device_type)
             for port in to_create:
                 try:
-                    rear_port = all_rearports[port["rear_port"]]
+                    rear_port = all_rearports[port['rear_port']]
                     port['rear_port'] = rear_port.id
                 except KeyError:
-                    self.handle.log(f'Could not find Rear Port for Front Port: {port["name"]} - '
-                        + f'{port["type"]} - {device_type}')
+                    self.handle.log(f'Could not find Rear Port for Front Port: {port['name']} - '
+                        + f'{port['type']} - {device_type}')
 
             try:
                 self.counter.update({'updated':
@@ -402,7 +460,7 @@ class DeviceTypes:
             existing_power_ports = self.get_module_power_ports(module_type)
             for outlet in to_create:
                 try:
-                    power_port = existing_power_ports[outlet["power_port"]]
+                    power_port = existing_power_ports[outlet['power_port']]
                     outlet['power_port'] = power_port.id
                 except KeyError:
                     pass
@@ -449,11 +507,11 @@ class DeviceTypes:
             existing_rear_ports = self.get_module_rear_ports(module_type)
             for port in to_create:
                 try:
-                    rear_port = existing_rear_ports[port["rear_port"]]
+                    rear_port = existing_rear_ports[port['rear_port']]
                     port['rear_port'] = rear_port.id
                 except KeyError:
-                    self.handle.log(f'Could not find Rear Port for Front Port: {port["name"]} - '
-                        + f'{port["type"]} - {module_type}')
+                    self.handle.log(f'Could not find Rear Port for Front Port: {port['name']} - '
+                        + f'{port['type']} - {module_type}')
 
             try:
                 self.counter.update({'updated':
@@ -480,6 +538,10 @@ class DeviceTypes:
 
         files = { i: (os.path.basename(f), open(f,"rb") ) for i,f in images.items() }
         response = requests.patch(url, headers=headers, files=files, verify=(not self.ignore_ssl))
-
-        self.handle.log( f'Images {images} updated at {url}: {response}' )
-        self.counter["images"] += len(images)
+        
+        if response.status_code == 500:
+            raise Exception(f"Remote server failed to write images. Ensure your media directory exists and is writable! - {response}")
+        else:
+            self.handle.log( f'Images {images} updated at {url}: {response} (Code {response.status_code})' )
+        
+        self.counter['images'] += len(images)
